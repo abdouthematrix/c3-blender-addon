@@ -7,7 +7,10 @@ class C3_MT_menu(bpy.types.Menu):
     def draw(self, context):
         layout = self.layout
         layout.operator("import_scene.c3_model", text="Import .C3 Model")
+        layout.operator("import_scene.c3_parts", text="Import .C3 Model Parts")
+        layout.separator()
         layout.operator("import_scene.c3_texture", text="Import Texture")
+        layout.separator()
         layout.operator("import_scene.c3_animation", text="Import Animation")
 
 def menu_func(self, context):

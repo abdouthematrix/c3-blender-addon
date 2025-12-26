@@ -32,7 +32,7 @@ class IMPORT_OT_c3_model(bpy.types.Operator, ImportHelper):
 
     def execute(self, context):
         # Start debug server if not already connected
-        if self.use_debugpy:            
+        if self.use_debugpy:
             import debugpy
             if not debugpy.is_client_connected():
                debugpy.listen(("127.0.0.1", 5678))
@@ -54,9 +54,6 @@ class IMPORT_OT_c3_model(bpy.types.Operator, ImportHelper):
         # Create a parent collection for all imports from this file
         file_collection = bpy.data.collections.new(filename)
         context.scene.collection.children.link(file_collection)
-        
-        # Store the C3 file path in the collection's custom properties
-        file_collection["c3_source_file"] = filepath
         
         c3_loader = c3_phy.C3Phy()        
         if not c3_loader.C3_Load(filepath):
@@ -96,8 +93,10 @@ class IMPORT_OT_c3_model(bpy.types.Operator, ImportHelper):
             
             # Store phy_index and source file path as custom properties on the object
             obj["c3_phy_index"] = phy_idx
-            obj["c3_source_file"] = filepath
-            
+            obj["c3_motion_index"] = phy_idx
+            obj["c3_phy_file"] = filepath
+            obj["c3_motion_file"] = filepath
+
             # Link object to the new collection instead of scene collection
             new_collection.objects.link(obj)
             context.view_layer.objects.active = obj
@@ -406,13 +405,16 @@ class IMPORT_OT_c3_animation(bpy.types.Operator, ImportHelper):
         # Try to get stored file path if option is enabled
         model_file = self.filepath
         animation_file = self.filepath
-        if self.use_stored_file and "c3_source_file" in obj:
-            model_file = obj["c3_source_file"]
+        if self.use_stored_file and "c3_phy_file" in obj:
+            model_file = obj["c3_phy_file"]
             self.report({'INFO'}, f"Using stored C3 file: {model_file}")
         
         # Get phy_index from object
         phy_index = obj.get("c3_phy_index", 0)
+        motion_index = obj.get("c3_motion_index", 0)
         
+        obj["c3_motion_file"] = model_file
+
         # Load the C3 file
         c3_loader = c3_phy.C3Phy()        
         if not c3_loader.C3_Load(model_file):
@@ -433,6 +435,10 @@ class IMPORT_OT_c3_animation(bpy.types.Operator, ImportHelper):
             self.report({'ERROR'}, f"Invalid phy_index {phy_index}, file has {c3_loader.m_dwPhyNum} phys")
             return {'CANCELLED'}
         
+        if motion_index >= motion_loader.m_dwMotionNum:
+            self.report({'ERROR'}, f"Invalid motion_index {motion_index}, file has {motion_loader.m_dwMotionNum} motions")
+            return {'CANCELLED'}      
+        
         # Get the corresponding phy and motion
         lpPhy = c3_loader.m_phy[phy_index]
         if lpPhy is None:
@@ -440,9 +446,9 @@ class IMPORT_OT_c3_animation(bpy.types.Operator, ImportHelper):
             return {'CANCELLED'}
         
         if phy_index < motion_loader.m_dwMotionNum:
-            lpPhy.lpMotion = motion_loader.m_motion[phy_index]
+            lpPhy.lpMotion = motion_loader.m_motion[motion_index]
         else:
-            self.report({'ERROR'}, f"No motion data for phy index {phy_index}")
+            self.report({'ERROR'}, f"No motion data for motion index {motion_index}")
             return {'CANCELLED'}
 
         if lpPhy.lpMotion:
@@ -499,13 +505,225 @@ class IMPORT_OT_c3_animation(bpy.types.Operator, ImportHelper):
         max_frame = lpPhy.lpMotion.dwFrames - 1
         bpy.context.scene.frame_end = max_frame
 
+class IMPORT_OT_c3_parts(bpy.types.Operator, ImportHelper):
+    """Load C3 part to replace existing mesh by name"""
+    bl_idname = "import_scene.c3_parts"
+    bl_label = "Load C3 Parts"
+    bl_options = {'REGISTER', 'UNDO'}
+    
+    filename_ext = ".c3"
+    filter_glob: StringProperty(default="*.c3", options={'HIDDEN'})
+    
+    load_texture: BoolProperty(
+        name="Load Texture",
+        description="Load texture file with same base name",
+        default=True
+    )
+    
+    def execute(self, context):
+        # Check if a mesh is selected
+        if not context.active_object or context.active_object.type != 'MESH':
+            self.report({'ERROR'}, "No mesh object selected")
+            return {'CANCELLED'}
+        
+        target_obj = context.active_object
+        mesh_name = target_obj.name
+        
+        # Get the active scene's collections
+        scene = context.scene
+        
+        # Load the new C3 file
+        c3_loader = c3_phy.C3Phy()        
+        if not c3_loader.C3_Load(self.filepath):
+            self.report({'ERROR'}, "Failed to load C3 file")
+            return {'CANCELLED'}
+        
+        if c3_loader.m_dwPhyNum == 0:
+            self.report({'ERROR'}, "No physics data found in C3 file")
+            return {'CANCELLED'}
+        
+        # Get the target phy (first one from loaded file)
+        target_phy = c3_loader.m_phy[0]
+        if target_phy is None:
+            self.report({'ERROR'}, "Target phy is None")
+            return {'CANCELLED'}
+        
+        # Store the original motion data and properties
+        stored_motion = None
+        stored_phy_index = target_obj.get("c3_phy_index", 0)
+        stored_motion_index = target_obj.get("c3_motion_index", 0)
+        stored_source_file = target_obj.get("c3_phy_file", "")
+        stored_motion_file = target_obj.get("c3_motion_file", "")
+        target_collection = None
+        
+        # Find which collection the object belongs to
+        for collection in bpy.data.collections:
+            if target_obj.name in collection.objects:
+                target_collection = collection
+                break
+        
+        # Try to get motion from original file if stored
+        if stored_motion_file:
+            original_loader = c3_motion.C3Motion()
+            if original_loader.C3_Load(stored_motion_file):
+                if stored_motion_index < original_loader.m_dwMotionNum:
+                    stored_motion = original_loader.m_motion[stored_motion_index]                    
+        
+        # Create new mesh data
+        new_mesh_name = mesh_name
+        new_mesh = bpy.data.meshes.new(new_mesh_name)
+        
+        # Assign the stored motion to target_phy if available
+        if stored_motion:
+            target_phy.lpMotion = stored_motion
+        else:
+            # Create default motion
+            target_phy.lpMotion = c3_motion.C3Motion()
+            target_phy.lpMotion.dwBoneCount = 1
+            target_phy.lpMotion.dwFrames = 1
+            target_phy.lpMotion.matrix = [Matrix.Identity(4)]
+            target_phy.lpMotion.nFrame = 0
+        
+        # Calculate vertices with motion
+        if target_phy.lpMotion:
+            c3_phy.C3Phy.Phy_Calculate(target_phy)
+        
+        # Build vertex list
+        vertices = []
+        for v in range(target_phy.dwNVecCount + target_phy.dwAVecCount):
+            if target_phy.lpMotion:
+                pos = target_phy.outputVertices[v].Position
+            else:
+                pos = target_phy.lpVB[v].pos[0]
+            vertices.append((pos.x, pos.y, pos.z))
+        
+        # Build face list
+        faces = []
+        for i in range(0, len(target_phy.lpIB), 3):
+            faces.append((target_phy.lpIB[i], target_phy.lpIB[i+1], target_phy.lpIB[i+2]))
+        
+        # Create mesh
+        new_mesh.from_pydata(vertices, [], faces)
+        new_mesh.update()
+        
+        # Add UV coordinates
+        if target_phy.lpVB:
+            uv_layer = new_mesh.uv_layers.new(name="UVMap")
+            for poly in new_mesh.polygons:
+                for loop_idx in poly.loop_indices:
+                    vert_idx = new_mesh.loops[loop_idx].vertex_index
+                    if vert_idx < len(target_phy.lpVB):
+                        uv_layer.data[loop_idx].uv = (
+                            target_phy.lpVB[vert_idx].TexCoord.x, 
+                            1 - target_phy.lpVB[vert_idx].TexCoord.y
+                        )
+        
+        # Replace the mesh data
+        old_mesh = target_obj.data
+        target_obj.data = new_mesh
+        
+        # Remove old mesh if no other objects use it
+        if old_mesh.users == 0:
+            bpy.data.meshes.remove(old_mesh)
+        
+        # Maintain object properties
+        target_obj["c3_phy_index"] = 0
+        target_obj["c3_motion_index"] = stored_motion_index
+        if stored_source_file:
+            target_obj["c3_phy_file"] = self.filepath
+        if stored_motion_file:
+            target_obj["c3_motion_file"] = stored_motion_file
+        
+        # Load and apply texture if requested
+        if self.load_texture:
+            base_path = os.path.dirname(self.filepath)
+            base_name = os.path.splitext(os.path.basename(self.filepath))[0]
+            
+            tex_path = None
+            for ext in ['.dds', '.tga', '.png', '.jpg']:
+                test_path = os.path.join(base_path, base_name + ext)
+                if os.path.exists(test_path):
+                    tex_path = test_path
+                    break
+            
+            if tex_path:
+                self.apply_texture(target_obj, tex_path)
+                self.report({'INFO'}, f"Applied texture: {tex_path}")
+        
+        # # Rebake animation if motion exists
+        # if stored_motion and stored_motion.dwFrames > 0:
+        #     # Clear existing shape keys
+        #     if target_obj.data.shape_keys:
+        #         shape_keys_to_remove = [sk for sk in target_obj.data.shape_keys.key_blocks if sk.name != "Basis"]
+        #         for sk in shape_keys_to_remove:
+        #             target_obj.shape_key_remove(sk)
+            
+        #     # Bake animation to shape keys
+        #     self.bake_mesh_to_shape_keys(target_obj, target_phy)
+        #     self.report({'INFO'}, f"Rebaked animation with {stored_motion.dwFrames} frames")
+        
+        self.report({'INFO'}, f"Replaced mesh part: {mesh_name}")
+        return {'FINISHED'}
+    
+    def apply_texture(self, obj, tex_path):
+        """Apply texture to the object"""
+        mat = bpy.data.materials.new(name="C3_Part_Material")
+        mat.use_nodes = True
+        bsdf = mat.node_tree.nodes["Principled BSDF"]
+        
+        tex_image = mat.node_tree.nodes.new('ShaderNodeTexImage')
+        tex_image.image = bpy.data.images.load(tex_path)
+        
+        mat.node_tree.links.new(bsdf.inputs['Base Color'], tex_image.outputs['Color'])
+        
+        if obj.data.materials:
+            obj.data.materials[0] = mat
+        else:
+            obj.data.materials.append(mat)
+    
+    def bake_mesh_to_shape_keys(self, obj, lpPhy):
+        """Bake animation frames to shape keys"""
+        if not lpPhy.lpMotion or lpPhy.lpMotion.dwFrames == 0:
+            return        
+        scene = bpy.context.scene
+
+        # Ensure Basis exists
+        if not obj.data.shape_keys:
+            obj.shape_key_add(name="Basis")
+
+        for frame in range(lpPhy.lpMotion.dwFrames + 1):
+            scene.frame_set(frame)
+
+            # Create shape key for this frame
+            sk = obj.shape_key_add(name=f"Frame_{frame}", from_mix=False)
+
+            c3_phy.C3Phy.Phy_SetFrame(lpPhy, frame)
+            c3_phy.C3Phy.Phy_Calculate(lpPhy)
+
+            for i, v in enumerate(lpPhy.outputVertices):
+                sk.data[i].co = v.Position
+
+            # Keyframe shape key value
+            sk.value = 0.0
+            sk.keyframe_insert(data_path="value", frame=frame - 1)
+
+            sk.value = 1.0
+            sk.keyframe_insert(data_path="value", frame=frame)
+
+            sk.value = 0.0
+            sk.keyframe_insert(data_path="value", frame=frame + 1)
+        
+        max_frame = lpPhy.lpMotion.dwFrames - 1
+        bpy.context.scene.frame_end = max_frame
 
 def register():
     bpy.utils.register_class(IMPORT_OT_c3_model)
     bpy.utils.register_class(IMPORT_OT_c3_texture)
     bpy.utils.register_class(IMPORT_OT_c3_animation)
+    bpy.utils.register_class(IMPORT_OT_c3_parts)
 
 def unregister():
+    bpy.utils.unregister_class(IMPORT_OT_c3_parts)
     bpy.utils.unregister_class(IMPORT_OT_c3_animation)
     bpy.utils.unregister_class(IMPORT_OT_c3_texture)
     bpy.utils.unregister_class(IMPORT_OT_c3_model)
